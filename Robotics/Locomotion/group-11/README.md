@@ -21,6 +21,10 @@ AMP-RSL-RL 做运动先验模仿，并进行重定向后做了仿真。
 ```
 - Demo
 
+
+https://github.com/user-attachments/assets/def9eb68-2b9f-4140-b821-069861d79e7a
+
+
 ## 2.使用RSL-RL进行强化学习训练A1机器人
 - 安装python模块 (for rsl-rl)
 ```bash
@@ -32,10 +36,13 @@ AMP-RSL-RL 做运动先验模仿，并进行重定向后做了仿真。
 ``` 
 - 运行测试
 ```bash
-run script for playing with 32 environments
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Velocity-Flat-Unitree-A1-v0  --num_envs 32 --load_run run_folder_name --checkpoint /logs/rsl_rl/unitree_a1_flat/XXX/model_xxx.pt
 ```
 - Demo
+
+
+https://github.com/user-attachments/assets/5505405c-07f5-4fe9-a590-8f98964b0ca3
+
 
 ## 3.复杂地形
 ### 四足
@@ -48,6 +55,11 @@ run script for playing with 32 environments
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Velocity-Rough-Unitree-Go2-Play-v0  --num_envs 32 --load_run run_folder_name --checkpoint /rsl_rl/unitree_go2_rough/XXX/model_xxx.pt
 ```
 - Demo
+
+
+https://github.com/user-attachments/assets/c0e7d9ab-8340-4dd0-a038-942c04129812
+
+
 ### 人形
 - 训练
 ```bash
@@ -58,6 +70,10 @@ run script for playing with 32 environments
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Velocity-Rough-G1-Play-v0  --num_envs 32 --load_run run_folder_name --checkpoint /logs/rsl_rl/g1_rough/XXX/model_xxx.pt
 ```
 - Demo
+
+
+https://github.com/user-attachments/assets/00a78609-d79d-4026-ad49-95e3b79c4403
+
 
 ## AMP
 ### 安装
