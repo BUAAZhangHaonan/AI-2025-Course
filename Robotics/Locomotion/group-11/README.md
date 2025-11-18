@@ -134,3 +134,7 @@ python scripts/rsl_rl/train.py --task LeggedLab-Isaac-AMP-Flat-G1-v0 --headless 
 python scripts/rsl_rl/play.py --task LeggedLab-Isaac-AMP-Flat-G1-Play-v0 --headless --num_envs 64 --video --checkpoint logs/rsl_rl/experiment_name/run_name/model_xxx.pt
 ```
 - Demo
+
+
+https://github.com/user-attachments/assets/c5f40eb8-bb46-4947-8b58-da07e7b857e2
+
