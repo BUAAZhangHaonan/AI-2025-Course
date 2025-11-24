@@ -1,0 +1,1094 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
+import torch
+import numpy as np
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from torch import nn
+import os
+from utils.system_utils import mkdir_p
+from plyfile import PlyData, PlyElement
+from utils.sh_utils import RGB2SH
+from simple_knn._C import distCUDA2
+from utils.graphics_utils import BasicPointCloud
+from utils.general_utils import strip_symmetric, build_scaling_rotation
+import json
+
+
+octree_max_depth = 12
+octree_max_gaussians = 20
+octree_bbox_min = [-1.0, -1.0, -1.0]
+octree_bbox_max = [1.0, 1.0, 1.0] 
+use_octree = False
+delete_high_in_the_end = False
+use_interlock = False
+
+class GaussianModel:
+    class OctreeNode:
+        def __init__(self, parent, bbox_min, bbox_max, depth=0):
+            self.parent = parent  # 指向父节点（GaussianModel）
+            self.bbox_min = torch.tensor(bbox_min, device="cuda") if not isinstance(bbox_min, torch.Tensor) else bbox_min.to("cuda")
+            self.bbox_max = torch.tensor(bbox_max, device="cuda") if not isinstance(bbox_max, torch.Tensor) else bbox_max.to("cuda")
+            self.depth = depth  # 节点深度
+            self.children = []  # 子节点索引，存储OctreeNode的列表，都是子节点最多八个
+            self.gaussian_indices = torch.tensor([], dtype=torch.long, device="cuda")  # 高斯核索引（仅叶子节点使用）
+
+        def is_leaf(self):
+            """判断当前节点是否为叶节点"""
+            return len(self.children) == 0
+
+
+
+    def setup_functions(self):
+        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            actual_covariance = L @ L.transpose(1, 2)
+            symm = strip_symmetric(actual_covariance)
+            return symm
+        
+        self.scaling_activation = torch.exp
+        self.scaling_inverse_activation = torch.log
+
+        self.covariance_activation = build_covariance_from_scaling_rotation
+
+        self.opacity_activation = torch.sigmoid
+        self.inverse_opacity_activation = inverse_sigmoid
+
+        self.rotation_activation = torch.nn.functional.normalize
+
+
+    def __init__(self, sh_degree : int):
+        self.active_sh_degree = 0
+        self.max_sh_degree = sh_degree  
+        self._xyz = torch.empty(0)
+        self._features_dc = torch.empty(0)
+        self._features_rest = torch.empty(0)
+        self._scaling = torch.empty(0)
+        self._rotation = torch.empty(0)
+        self._opacity = torch.empty(0)
+        self.max_radii2D = torch.empty(0)
+        self.xyz_gradient_accum = torch.empty(0)
+        self.denom = torch.empty(0)
+        self.optimizer = None
+        self.percent_dense = 0
+        self.spatial_lr_scale = 0
+        self.setup_functions()
+        self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
+        self.all_xyz = None
+        self.conbine_cnt = 0
+
+    
+
+    def reset_octree(self):
+        """重置八叉树，并根据 self.get_xyz 插入所有高斯核"""
+        if not use_octree:
+            return
+        # 重置八叉树根节点
+        self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
+        self.all_xyz = self.get_xyz
+
+        # 使用栈来模拟递归插入
+        stack = [(self.octree_root, torch.arange(self.all_xyz.shape[0], device="cuda"))]
+        while stack:
+            node, gaussian_indices = stack.pop()
+
+            # 如果当前节点是叶节点且未达到高斯核数量上限，直接插入
+            # if node.is_leaf() and len(gaussian_indices) <= octree_max_gaussians:
+            if len(gaussian_indices) <= octree_max_gaussians:
+                node.gaussian_indices = gaussian_indices
+                continue  # 处理完毕，直接 pop
+
+            # 如果当前节点是叶节点但达到高斯核数量上限，分裂节点
+            if True:
+                # 如果到达层数上限,不分裂
+                if node.depth == octree_max_depth:
+                    node.gaussian_indices = gaussian_indices
+                    continue  # 处理完毕，直接 pop
+
+                # 计算当前节点的中心点
+                mid = (node.bbox_min + node.bbox_max) / 2
+
+                # 创建8个子节点
+                for i in range(8):
+                    child_bbox_min = torch.tensor([
+                        node.bbox_min[0] if (i & 1) == 0 else mid[0],
+                        node.bbox_min[1] if (i & 2) == 0 else mid[1],
+                        node.bbox_min[2] if (i & 4) == 0 else mid[2],
+                    ], device="cuda")
+                    child_bbox_max = torch.tensor([
+                        mid[0] if (i & 1) == 0 else node.bbox_max[0],
+                        mid[1] if (i & 2) == 0 else node.bbox_max[1],
+                        mid[2] if (i & 4) == 0 else node.bbox_max[2],
+                    ], device="cuda")
+                    node.children.append(self.OctreeNode(self, child_bbox_min, child_bbox_max, node.depth + 1))
+
+                # 获取所有待插入高斯核的坐标
+                xyz = self.all_xyz[gaussian_indices]
+
+                # 使用布尔索引高效分配索引到八个子节点
+                for i, child in enumerate(node.children):
+                    # 筛选出在子节点范围内的索引
+                    mask = torch.all((child.bbox_min <= xyz) & (xyz <= child.bbox_max), dim=1)
+                    indices = gaussian_indices[mask]
+                    # 如果索引不为空，将子节点和对应的高斯核索引压入栈中
+                    if len(indices) > 0:
+                        stack.append((child, indices))
+
+    def get_gaussians_num(self):
+        return self._xyz.shape[0]
+
+    def increse_max_depth(self):
+        if not use_interlock:
+            return
+    
+        global octree_max_depth
+        if octree_max_depth < 12:
+            octree_max_depth += 1
+
+
+    def build_octree(self):
+        """重置八叉树，并根据 self.get_xyz 插入所有高斯核"""
+        
+        # 计算所有坐标的最小/最大值（确保在 CUDA 上计算）
+        min_vals = torch.min(self._xyz, dim=0)[0]  # (x_min, y_min, z_min)
+        max_vals = torch.max(self._xyz, dim=0)[0]  # (x_max, y_max, z_max)
+        # print(f"x: min={min_vals[0]}, max={max_vals[0]}")
+        # print(f"y: min={min_vals[1]}, max={max_vals[1]}")
+        # print(f"z: min={min_vals[2]}, max={max_vals[2]}")
+        # 计算边界框的冗余量（padding），并确保在 CUDA 上
+        padding = 0.1 * (max_vals - min_vals)  # 10% 的冗余量，可根据需求调整
+        octree_bbox_min = (min_vals - padding).to("cuda")  # 确保是 CUDA 张量
+        octree_bbox_max = (max_vals + padding).to("cuda")  # 确保是 CUDA 张量
+        print(f"八叉树边界框 min: {octree_bbox_min}")
+        print(f"八叉树边界框 max: {octree_bbox_max}")
+
+        # 重置八叉树根节点
+        self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
+        self.all_xyz = self.get_xyz
+
+        # 使用栈来模拟递归插入
+        stack = [(self.octree_root, torch.arange(self.all_xyz.shape[0], device="cuda"))]
+
+        total_assigned = 0
+        assign_in_low = 0
+        assign_in_high = 0
+        # 用于收集需要删除的高斯核索引
+        gaussians_to_prune = []
+        while stack:
+            node, gaussian_indices = stack.pop()
+
+            # 如果当前节点是叶节点且未达到高斯核数量上限，直接插入
+            # if node.is_leaf() and len(gaussian_indices) <= octree_max_gaussians:
+            if len(gaussian_indices) <= octree_max_gaussians:
+                # print("低密度 ", gaussian_indices.shape)
+                total_assigned += len(gaussian_indices)
+                assign_in_low += len(gaussian_indices)
+                node.gaussian_indices = gaussian_indices
+                continue  # 处理完毕，直接 pop
+
+            # 如果当前节点是叶节点但达到高斯核数量上限，分裂节点
+            
+                # 如果到达层数上限,不分裂
+            if node.depth == octree_max_depth:
+                node.gaussian_indices = gaussian_indices
+                gaussians_to_prune.append(gaussian_indices)
+                total_assigned += len(gaussian_indices)
+                assign_in_high += len(gaussian_indices)
+                # print("高密度 ", gaussian_indices.shape)
+                continue  # 处理完毕，直接 pop
+
+                # 计算当前节点的中心点
+            mid = (node.bbox_min + node.bbox_max) / 2
+
+            # 获取所有高斯核的坐标
+            xyz = self._xyz[gaussian_indices]
+
+            # 预计算每个高斯核在 8 个子节点中的分配情况
+            # 使用位掩码表示分配情况（0-7 对应 8 个子节点）
+            assignments = torch.full((len(gaussian_indices),), -1, device="cuda")
+            # 定义 8 个子节点的边界框条件
+            child_conditions = [
+                (xyz[:, 0] < mid[0]) & (xyz[:, 1] < mid[1]) & (xyz[:, 2] < mid[1]),  # 子节点0
+                (xyz[:, 0] >= mid[0]) & (xyz[:, 1] < mid[1]) & (xyz[:, 2] < mid[1]),  # 子节点1
+                (xyz[:, 0] >= mid[0]) & (xyz[:, 1] >= mid[1]) & (xyz[:, 2] < mid[1]), # 子节点2
+                (xyz[:, 0] < mid[0]) & (xyz[:, 1] >= mid[1]) & (xyz[:, 2] < mid[1]),  # 子节点3
+                (xyz[:, 0] < mid[0]) & (xyz[:, 1] < mid[1]) & (xyz[:, 2] >= mid[1]),   # 子节点4
+                (xyz[:, 0] >= mid[0]) & (xyz[:, 1] < mid[1]) & (xyz[:, 2] >= mid[1]),  # 子节点5
+                (xyz[:, 0] >= mid[0]) & (xyz[:, 1] >= mid[1]) & (xyz[:, 2] >= mid[1]), # 子节点6
+                (xyz[:, 0] < mid[0]) & (xyz[:, 1] >= mid[1]) & (xyz[:, 2] >= mid[1]),  # 子节点7
+            ]
+            # 分配高斯核到子节点
+            for child_idx, condition in enumerate(child_conditions):
+                mask = condition & (assignments == -1)  # 只分配未分配的高斯核
+                assignments[mask] = child_idx
+            # 创建有高斯核的子节点
+            for child_idx in range(8):
+                indices = gaussian_indices[assignments == child_idx]
+                if len(indices) > 0:  # 只有存在高斯核时才创建子节点
+                    # 根据子节点索引计算边界框
+                    if child_idx == 0:
+                        bbox_min, bbox_max = node.bbox_min, mid
+                    elif child_idx == 1:
+                        bbox_min = torch.tensor([mid[0], node.bbox_min[1], node.bbox_min[2]], device="cuda")
+                        bbox_max = torch.tensor([node.bbox_max[0], mid[1], mid[2]], device="cuda")
+                    elif child_idx == 2:
+                        bbox_min = torch.tensor([mid[0], mid[1], node.bbox_min[2]], device="cuda")
+                        bbox_max = torch.tensor([node.bbox_max[0], node.bbox_max[1], mid[2]], device="cuda")
+                    elif child_idx == 3:
+                        bbox_min = torch.tensor([node.bbox_min[0], mid[1], node.bbox_min[2]], device="cuda")
+                        bbox_max = torch.tensor([mid[0], node.bbox_max[1], mid[2]], device="cuda")
+                    elif child_idx == 4:
+                        bbox_min = torch.tensor([node.bbox_min[0], node.bbox_min[1], mid[2]], device="cuda")
+                        bbox_max = torch.tensor([mid[0], mid[1], node.bbox_max[2]], device="cuda")
+                    elif child_idx == 5:
+                        bbox_min = torch.tensor([mid[0], node.bbox_min[1], mid[2]], device="cuda")
+                        bbox_max = torch.tensor([node.bbox_max[0], mid[1], node.bbox_max[2]], device="cuda")
+                    elif child_idx == 6:
+                        bbox_min, bbox_max = mid, node.bbox_max
+                    elif child_idx == 7:
+                        bbox_min = torch.tensor([node.bbox_min[0], mid[1], mid[2]], device="cuda")
+                        bbox_max = torch.tensor([mid[0], node.bbox_max[1], node.bbox_max[2]], device="cuda")
+                    # 创建子节点并压入栈
+                    child = self.OctreeNode(self, bbox_min, bbox_max, node.depth + 1)
+                    node.children.append(child)
+                    stack.append((child, indices))
+            # 处理未被分配的高斯核（应该很少）
+            unassigned = gaussian_indices[assignments == -1]
+            if len(unassigned) > 0:
+                print(f"注意：{len(unassigned)}个高斯核未被分配到任何子节点")
+
+        
+        # 如果有需要删除的高斯核，统一进行删除
+        if gaussians_to_prune and delete_high_in_the_end:
+            # 合并所有需要删除的高斯核索引
+            all_prune_indices = torch.cat([indices for indices in gaussians_to_prune])
+            # print(all_prune_indices)
+            print("total assign: ", total_assigned)
+            print("high assign: ", assign_in_high)
+            print("low assign: ", assign_in_low)
+
+            print("待删除 ", all_prune_indices.shape)
+            print("删除之前总共 ", self._xyz.shape[0])
+            # 创建删除掩码
+            prune_mask = torch.zeros(self.all_xyz.shape[0], dtype=torch.bool, device="cuda")
+            prune_mask[all_prune_indices] = True
+            # 调用prune_points函数删除这些高斯核
+            self.prune_points(prune_mask)
+            print("删除之后总共 ", self._xyz.shape[0])
+
+    def build_octree2(self):
+        """优化后的八叉树构建函数"""
+        
+        # 1. 边界框计算优化
+        min_vals = torch.min(self._xyz, dim=0)[0]
+        max_vals = torch.max(self._xyz, dim=0)[0]
+        padding = 0.1 * (max_vals - min_vals)
+        octree_bbox_min = (min_vals - padding).to("cuda")
+        octree_bbox_max = (max_vals + padding).to("cuda")
+
+        # 2. 初始化八叉树
+        self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
+        self.all_xyz = self.get_xyz
+        
+        # 3. 使用栈进行非递归处理
+        stack = [(self.octree_root, torch.arange(self.all_xyz.shape[0], device="cuda"))]
+        
+        # 预分配统计变量
+        stats = torch.zeros(3, dtype=torch.int64, device="cuda")  # [total, low, high]
+        gaussians_to_prune = []
+
+        while stack:
+            node, gaussian_indices = stack.pop()
+            num_gaussians = len(gaussian_indices)
+            
+            # 4. 优化条件判断顺序
+            if num_gaussians <= octree_max_gaussians:
+                node.gaussian_indices = gaussian_indices
+                stats += torch.tensor([num_gaussians, num_gaussians, 0], device="cuda")
+                continue
+                
+            if node.depth == octree_max_depth:
+                node.gaussian_indices = gaussian_indices
+                gaussians_to_prune.append(gaussian_indices)
+                stats += torch.tensor([num_gaussians, 0, num_gaussians], device="cuda")
+                continue
+                
+            # 5. 向量化子节点分配
+            mid = (node.bbox_min + node.bbox_max) / 2
+            xyz = self._xyz[gaussian_indices]
+            
+            # 使用位运算计算子节点索引 (3位表示xyz是否>=mid)
+            child_idx = ((xyz >= mid).to(torch.int64) * torch.tensor([4, 2, 1], device="cuda")).sum(dim=1)
+            
+            # 6. 批量创建子节点
+            for i in range(8):
+                mask = (child_idx == i)
+                indices = gaussian_indices[mask]
+                if len(indices) == 0:
+                    continue
+                    
+                # 预计算所有子节点边界框
+                bbox_min = node.bbox_min.clone()
+                bbox_max = node.bbox_max.clone()
+                
+                # 根据子节点索引调整边界框
+                if i & 4: bbox_min[0] = mid[0]
+                else: bbox_max[0] = mid[0]
+                
+                if i & 2: bbox_min[1] = mid[1]
+                else: bbox_max[1] = mid[1]
+                
+                if i & 1: bbox_min[2] = mid[2]
+                else: bbox_max[2] = mid[2]
+                
+                child = self.OctreeNode(self, bbox_min, bbox_max, node.depth + 1)
+                node.children.append(child)
+                stack.append((child, indices))
+                
+            # 处理未分配的高斯核
+            unassigned = gaussian_indices[child_idx >= 8]
+            if len(unassigned) > 0:
+                print(f"注意：{len(unassigned)}个高斯核未被分配到任何子节点")
+
+        # 7. 批量删除处理
+        if gaussians_to_prune and delete_high_in_the_end:
+            all_prune_indices = torch.cat(gaussians_to_prune)
+            prune_mask = torch.zeros(self.all_xyz.shape[0], dtype=torch.bool, device="cuda")
+            prune_mask[all_prune_indices] = True
+            self.prune_points(prune_mask)
+            
+            # 打印统计信息
+            print(f"分配统计: 总数={stats[0]}, 低密度={stats[1]}, 高密度={stats[2]}")
+            print(f"删除操作: 之后={self._xyz.shape[0]}")
+
+
+    def dump_octree_to_file(self, model_path):
+        """将八叉树结构（不含叶子节点的高斯核索引）输出到 JSON 文件"""
+        return
+
+        # if not use_octree:
+        self.build_octree2()
+        
+        filename = "octree_structure.json"
+
+        def _node_to_dict(node):
+            """将八叉树节点转换为字典（不记录叶子节点的具体高斯核索引）"""
+            node_dict = {
+                "depth": node.depth,
+                "gaussian_count": len(node.gaussian_indices) if hasattr(node, 'gaussian_indices') else 0,
+                "is_high_density": len(node.gaussian_indices) > octree_max_gaussians if hasattr(node, 'gaussian_indices') else False,
+                # "bbox_min": node.bbox_min.tolist(),
+                # "bbox_max": node.bbox_max.tolist(),
+                "is_leaf": node.is_leaf(),
+            }
+            
+            # 只记录子节点结构，不记录叶子节点的gaussian_indices
+            if not node.is_leaf():
+                node_dict["children"] = [_node_to_dict(child) for child in node.children]
+            
+            return node_dict
+
+        # 构建八叉树的字典表示
+        octree_dict = {
+            "max_depth": octree_max_depth,
+            "max_gaussians_per_node": octree_max_gaussians,
+            "total_gaussians": self._xyz.shape[0],
+            "global_bbox_min": self.octree_root.bbox_min.tolist(),  # 使用根节点的边界框
+            "global_bbox_max": self.octree_root.bbox_max.tolist(),
+            "structure": _node_to_dict(self.octree_root),
+        }
+
+        save_path = os.path.join(model_path, filename)
+        
+        # 写入JSON文件（添加类型检查确保可序列化）
+        def default_serializer(obj):
+            if isinstance(obj, (torch.Tensor, np.ndarray)):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+        with open(save_path, "w") as f:
+            json.dump(octree_dict, f, indent=2, default=default_serializer)
+
+
+
+
+    def capture(self):
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            self.xyz_gradient_accum,
+            self.denom,
+            self.optimizer.state_dict(),
+            self.spatial_lr_scale,
+        )
+    
+    def restore(self, model_args, training_args):
+        (self.active_sh_degree, 
+        self._xyz, 
+        self._features_dc, 
+        self._features_rest,
+        self._scaling, 
+        self._rotation, 
+        self._opacity,
+        self.max_radii2D, 
+        xyz_gradient_accum, 
+        denom,
+        opt_dict, 
+        self.spatial_lr_scale) = model_args
+        self.training_setup(training_args)
+        self.xyz_gradient_accum = xyz_gradient_accum
+        self.denom = denom
+        self.optimizer.load_state_dict(opt_dict)
+
+    @property
+    def get_scaling(self):
+        return self.scaling_activation(self._scaling)
+    
+    @property
+    def get_rotation(self):
+        return self.rotation_activation(self._rotation)
+    
+    @property
+    def get_xyz(self):
+        return self._xyz
+    
+    @property
+    def get_features(self):
+        features_dc = self._features_dc
+        features_rest = self._features_rest
+        return torch.cat((features_dc, features_rest), dim=1)
+    
+    @property
+    def get_opacity(self):
+        return self.opacity_activation(self._opacity)
+    
+    def get_covariance(self, scaling_modifier = 1):
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+
+    def oneupSHdegree(self):
+        if self.active_sh_degree < self.max_sh_degree:
+            self.active_sh_degree += 1
+
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        self.spatial_lr_scale = spatial_lr_scale
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+
+
+        ############################ 新增代码 ############################
+        # 初始化八叉树，将所有初始高斯核插入树中
+        # self.reset_octree()
+
+
+    def training_setup(self, training_args):
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        l = [
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+        ]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=training_args.position_lr_max_steps)
+
+    def update_learning_rate(self, iteration):
+        ''' Learning rate scheduling per step '''
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                lr = self.xyz_scheduler_args(iteration)
+                param_group['lr'] = lr
+                return lr
+
+    def construct_list_of_attributes(self):
+        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        # All channels except the 3 DC
+        for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
+            l.append('f_dc_{}'.format(i))
+        for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
+            l.append('f_rest_{}'.format(i))
+        l.append('opacity')
+        for i in range(self._scaling.shape[1]):
+            l.append('scale_{}'.format(i))
+        for i in range(self._rotation.shape[1]):
+            l.append('rot_{}'.format(i))
+        return l
+
+    def save_ply(self, path):
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self._xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
+    def reset_opacity(self):
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
+    def load_ply(self, path):
+        plydata = PlyData.read(path)
+
+        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
+                        np.asarray(plydata.elements[0]["y"]),
+                        np.asarray(plydata.elements[0]["z"])),  axis=1)
+        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+
+        features_dc = np.zeros((xyz.shape[0], 3, 1))
+        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
+        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
+        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+
+        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+        extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
+        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
+        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+        for idx, attr_name in enumerate(extra_f_names):
+            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+
+        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+        scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
+        scales = np.zeros((xyz.shape[0], len(scale_names)))
+        for idx, attr_name in enumerate(scale_names):
+            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+        rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
+        rots = np.zeros((xyz.shape[0], len(rot_names)))
+        for idx, attr_name in enumerate(rot_names):
+            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        self.active_sh_degree = self.max_sh_degree
+
+
+    def replace_tensor_to_optimizer(self, tensor, name):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if group["name"] == name:
+                stored_state = self.optimizer.state.get(group['params'][0], None)
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+        return optimizable_tensors
+
+    def _prune_optimizer(self, mask):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+        return optimizable_tensors
+
+    def prune_points(self, mask):
+        valid_points_mask = ~mask
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+
+        self.denom = self.denom[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+
+
+    def cat_tensors_to_optimizer(self, tensors_dict):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            assert len(group["params"]) == 1
+            extension_tensor = tensors_dict[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+
+        return optimizable_tensors
+
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+        d = {"xyz": new_xyz,
+        "f_dc": new_features_dc,
+        "f_rest": new_features_rest,
+        "opacity": new_opacities,
+        "scaling" : new_scaling,
+        "rotation" : new_rotation}
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        # Extract points that satisfy the gradient condition
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        means =torch.zeros((stds.size(0), 3),device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+
+        # print(new_xyz.shape)
+        # print(new_features_dc.shape)
+        # print(new_features_rest.shape)
+        # print(new_opacity.shape)
+        # print(new_scaling.shape)
+        # print(new_rotation.shape)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
+
+        torch.cuda.empty_cache()
+
+    def add_random_gaussian(self, num_gaussians=1):
+        """
+        添加具有随机属性的高斯核
+        
+        参数:
+            num_gaussians: 要添加的高斯核数量
+        """
+        device = self._xyz.device
+        
+        # 随机生成各属性
+        new_xyz = torch.rand((num_gaussians, 3), device=device) * 2 - 1  # 位置在[-1,1]范围内
+        
+        # 特征 (dc和rest)
+        new_features_dc = torch.rand((num_gaussians, 1, 3), device=device) * 2 - 1
+        new_features_rest = torch.rand((num_gaussians, 15, 3), device=device) * 2 - 1
+        
+        # 缩放 (使用指数激活确保为正)
+        new_scaling = torch.rand((num_gaussians, 3), device=device) * 0.1  # 小初始值
+        
+        # 旋转 (归一化为单位四元数)
+        rand_rot = torch.randn((num_gaussians, 4), device=device)
+        new_rotation = rand_rot / torch.norm(rand_rot, dim=1, keepdim=True)
+        
+        # 不透明度 (使用sigmoid激活确保在[0,1]范围内)
+        new_opacity = torch.rand((num_gaussians, 1), device=device)
+        
+        # 使用densification_postfix添加新核
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, 
+                                new_opacity, new_scaling, new_rotation)
+
+    def merge_high_density(self):
+        if not use_octree:
+            return False
+        
+        device = self._xyz.device
+        # 阶段1：收集所有需要合并的叶子节点和对应的高斯索引
+        merge_candidates = []
+        stack = [self.octree_root]
+
+        while stack:
+            node = stack.pop()
+            if node.is_leaf():
+                if node.depth == octree_max_depth and len(node.gaussian_indices) > octree_max_gaussians:
+                    merge_candidates.append(node)
+            else:
+                for child in reversed(node.children):
+                    stack.append(child)
+
+        if not merge_candidates:
+            return False
+
+        self.conbine_cnt += 1
+        # 阶段2：为每个候选节点创建合并后的高斯核
+            # 阶段2：为每个候选节点创建合并后的高斯核（加权平均版本）
+        new_xyzs = []
+        new_features_dcs = []
+        new_features_rests = []
+        new_scalings = []
+        new_rotations = []
+        new_opacities = []
+
+        for node in merge_candidates:
+            indices = node.gaussian_indices
+            # num_gaussians = len(indices)
+            
+            # 获取当前节点内所有高斯核的相关参数
+            xyzs = self._xyz[indices]  # [m, 3]
+            features_dcs = self._features_dc[indices]  # [m, 1, 3]
+            features_rests = self._features_rest[indices]  # [m, 15, 3]
+            scalings = self._scaling[indices]  # [m, 3]
+            rotations = self._rotation[indices]  # [m, 4]
+            opacities = self._opacity[indices]  # [m, 1]
+            
+            # 1. 计算每个高斯核的体积权重 (volume * abs_opacity)
+            abs_scaling = torch.abs(scalings)  # [m, 3]
+            volumes = torch.prod(abs_scaling, dim=1, keepdim=True)  # [m, 1]
+            total_volume = torch.sum(volumes)  # 标量
+            abs_opacity = torch.abs(opacities)  # [m, 1]
+            weights = volumes * abs_opacity  # [m, 1]
+            weights = weights / (torch.sum(weights, dim=0) + 1e-6)  # 归一化权重 [m, 1]
+            # print(weights.shape)
+            
+
+            # print(weights.shape)
+            # print((xyzs * weights).shape)
+            # print(torch.sum(xyzs * weights, dim=0, keepdim=True).shape)
+            # 加权合并位置 (xyz)
+            weighted_xyz = torch.sum(xyzs * weights, dim=0, keepdim=True)  # [1, 3]
+            
+            # 加权合并主特征 (features_dc)
+            # print("处理前后: ")
+            # print(features_dcs)
+            weighted_features_dc = torch.sum(features_dcs * weights.unsqueeze(-1), dim=0, keepdim=True)  # [1, 1, 3]
+            # print(weighted_features_dc)
+            
+            # 加权合并其他特征 (features_rest)
+            # print("处理前后: ")
+            # print(features_rests.shape)
+            weighted_features_rest = torch.sum(features_rests * weights.unsqueeze(-1), 
+                                            dim=0, keepdim=True)  # [1, 15, 3]
+            # print(weighted_features_rest.shape)
+            
+            
+            # 加权合并缩放 (scaling)
+            weighted_scaling = torch.sum(scalings * weights, dim=0, keepdim=True)  # [1, 3]
+            # weighted_scaling = (total_volume ** (1/3)) * torch.ones_like(scalings[:1])  # [1, 3]
+
+            # 加权合并旋转 (rotation) - 四元数需要特殊处理
+            weighted_rotation = torch.sum(rotations * weights, dim=0, keepdim=True)  # [1, 4]
+            weighted_rotation = weighted_rotation / torch.norm(weighted_rotation, dim=1, keepdim=True)  # 归一化
+            
+            # 加权合并不透明度 (opacity)
+            weighted_opacity = torch.sum(opacities * weights, dim=0, keepdim=True)  # [1, 1]
+            
+            # 收集合并后的高斯核
+            new_xyzs.append(weighted_xyz)
+            new_features_dcs.append(weighted_features_dc)
+            new_features_rests.append(weighted_features_rest)
+            new_scalings.append(weighted_scaling)
+            new_rotations.append(weighted_rotation)
+            new_opacities.append(weighted_opacity)
+
+        # 阶段3：将所有合并后的高斯核连接起来
+        
+        if new_xyzs:
+            new_xyz = torch.cat(new_xyzs, dim=0).to(device)  # [n, 3]
+            new_features_dc = torch.cat(new_features_dcs, dim=0).to(device)  # [n, 1, 3]
+            new_features_rest = torch.cat(new_features_rests, dim=0).to(device)  # [n, 15, 3]
+            new_scaling = torch.cat(new_scalings, dim=0).to(device)  # [n, 3]
+            new_rotation = torch.cat(new_rotations, dim=0).to(device)  # [n, 4]
+            new_opacity = torch.cat(new_opacities, dim=0).to(device)  # [n, 1]
+
+            # 阶段4：将合并后的高斯核添加到系统中
+            self.densification_postfix(
+                new_xyz, 
+                new_features_dc, 
+                new_features_rest, 
+                new_opacity, 
+                new_scaling, 
+                new_rotation
+            )
+
+            # 阶段5：创建修剪掩码，移除被合并的高斯核
+            prune_mask = torch.zeros_like(self._xyz[:, 0], dtype=torch.bool, device=device)  # [total_gaussians]
+            for node in merge_candidates:
+                prune_mask[node.gaussian_indices] = True
+            
+            # 保留未合并的高斯核
+            self.prune_points(prune_mask)
+        return True
+    
+    def merge_high_density2(self):
+        """直接筛选高密度区域并融合，无需构建完整八叉树"""
+        if not use_octree:
+            return False
+        
+        device = self._xyz.device
+        total_gaussians = self._xyz.shape[0]
+        
+        # 阶段1：模拟八叉树分割过程，直接筛选高密度区域
+        merge_candidates = []
+        
+        # 计算全局边界框
+        min_vals = torch.min(self._xyz, dim=0)[0]
+        max_vals = torch.max(self._xyz, dim=0)[0]
+        padding = 0.1 * (max_vals - min_vals)
+        bbox_min = (min_vals - padding).to(device)
+        bbox_max = (max_vals + padding).to(device)
+        
+        # 使用栈模拟分割过程 (bbox_min, bbox_max, depth, gaussian_indices)
+        stack = [(bbox_min, bbox_max, 0, torch.arange(total_gaussians, device=device))]
+        
+        while stack:
+            curr_min, curr_max, depth, indices = stack.pop()
+            num_gaussians = len(indices)
+            
+            # 如果达到最大深度且超过高斯核数量限制，标记为待合并区域
+            if depth == octree_max_depth and num_gaussians > octree_max_gaussians:
+                merge_candidates.append(indices)
+                continue
+            
+            # 如果数量不足或达到最大深度，跳过分割
+            if num_gaussians <= octree_max_gaussians or depth >= octree_max_depth:
+                continue
+            
+            # 计算当前区域中点
+            mid = (curr_min + curr_max) / 2
+            
+            # 获取当前区域内高斯核坐标
+            xyz = self._xyz[indices]
+            
+            # 使用位运算快速分配子区域
+            child_idx = ((xyz >= mid).to(torch.int64) * torch.tensor([4, 2, 1], device=device)).sum(dim=1)
+            
+            # 处理8个子区域
+            for i in range(8):
+                mask = (child_idx == i)
+                if not mask.any():
+                    continue
+                
+                # 计算子区域边界框
+                child_min = curr_min.clone()
+                child_max = curr_max.clone()
+                
+                if i & 4: child_min[0] = mid[0]
+                else: child_max[0] = mid[0]
+                
+                if i & 2: child_min[1] = mid[1]
+                else: child_max[1] = mid[1]
+                
+                if i & 1: child_min[2] = mid[2]
+                else: child_max[2] = mid[2]
+                
+                # 压入栈继续处理
+                stack.append((child_min, child_max, depth + 1, indices[mask]))
+        
+        if not merge_candidates:
+            return False
+        
+        self.conbine_cnt += 1
+        
+        # 阶段2：批量合并高密度区域
+        # 预分配结果张量
+        num_merge = len(merge_candidates)
+        new_xyz = torch.zeros((num_merge, 3), device=device)
+        new_features_dc = torch.zeros((num_merge, 1, 3), device=device)
+        new_features_rest = torch.zeros((num_merge, 15, 3), device=device)
+        new_scaling = torch.zeros((num_merge, 3), device=device)
+        new_rotation = torch.zeros((num_merge, 4), device=device)
+        new_opacity = torch.zeros((num_merge, 1), device=device)
+        
+        # 并行处理所有合并区域
+        for i, indices in enumerate(merge_candidates):
+            # 获取当前区域所有高斯参数
+            xyzs = self._xyz[indices]
+            features_dcs = self._features_dc[indices]
+            features_rests = self._features_rest[indices]
+            scalings = self._scaling[indices]
+            rotations = self._rotation[indices]
+            opacities = self._opacity[indices]
+            # print("opacities ", opacities)
+            
+            # 计算权重 (volume * opacity)
+            abs_scaling = torch.abs(scalings)
+            true_scaling = torch.exp(scalings)
+            volumes = torch.prod(true_scaling, dim=1, keepdim=True)
+            # volumes = torch.prod(abs_scaling, dim=1, keepdim=True)
+            total_volume = torch.sum(volumes)
+            # abs_opacity = torch.abs(opacities)
+            not_opacities = torch.sigmoid(-opacities)
+            weights = volumes * not_opacities
+            weights = weights / (torch.sum(weights) + 1e-6)
+            # print("not_opacities ", not_opacities)
+            # print("true_scaling ", true_scaling)
+
+            
+            # 加权合并各项参数
+            new_xyz[i] = torch.sum(xyzs * weights, dim=0)
+            new_features_dc[i] = torch.sum(features_dcs * weights.unsqueeze(-1), dim=0)
+            new_features_rest[i] = torch.sum(features_rests * weights.unsqueeze(-1), dim=0)
+
+            # avg_scale_ratio = torch.sum(true_scaling * weights, dim=0) # [1,3]
+            # finial_scale = torch.pow((total_volume / torch.prod(avg_scale_ratio, dim=1)), 1/3) * avg_scale_ratio
+            # new_scale_value = torch.log(torch.pow(total_volume, 1/3))  # 总和的1/3次方
+            # print("finial_scale ", finial_scale)
+            new_scale_value = torch.log(total_volume) / 3 # 总和的1/3次方
+            new_scaling[i] = torch.full((1, 3), new_scale_value, 
+                               dtype=scalings.dtype, 
+                               device=scalings.device)
+            # print("new_scaling[i] ", new_scaling[i])
+            # print(new_scaling[i])
+            # new_scaling[i] = torch.sum(scalings * weights, dim=0)
+            
+            # 特殊处理旋转(四元数)
+            # weighted_rot = torch.sum(rotations * weights, dim=0)
+            # new_rotation[i] = weighted_rot / torch.norm(weighted_rot)
+            new_rotation[i] = rotations[0]
+            
+            # new_opacity[i] = torch.sum(opacities * weights, dim=0)
+            new_opacity[i] = torch.min(opacities)
+            # new_opacity[i] = inverse_sigmoid(1 - torch.sum(not_opacities * weights, dim=0))
+            # print("new_opacity[i] ", new_opacity[i])
+
+        
+        # 阶段3：添加合并后的高斯核并删除原始高斯核
+        if num_merge > 0:
+            self.densification_postfix(
+                new_xyz, 
+                new_features_dc, 
+                new_features_rest, 
+                new_opacity, 
+                new_scaling, 
+                new_rotation
+            )
+            
+            # 创建修剪掩码
+            prune_mask = torch.zeros_like(self._xyz[:, 0], dtype=torch.bool, device=device)
+            for indices in merge_candidates:
+                prune_mask[indices] = True
+            
+            self.prune_points(prune_mask)
+
+            
+            
+        
+        return True
+
+    def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        self.denom[update_filter] += 1
