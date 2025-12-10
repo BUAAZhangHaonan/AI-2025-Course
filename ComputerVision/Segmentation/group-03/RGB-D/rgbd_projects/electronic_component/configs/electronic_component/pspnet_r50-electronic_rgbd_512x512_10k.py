@@ -1,0 +1,256 @@
+# PSPNet RGBD 配置文件 - Electronic Component 数据集
+# 使用 ResNet50 + 4通道RGBD输入，输入尺寸512x512
+
+_base_ = [
+    '../../../../configs/_base_/models/pspnet_r50-d8.py',
+    '../../../../configs/_base_/default_runtime.py',
+    '../../../../configs/_base_/schedules/schedule_20k.py'
+]
+
+# 自定义导入
+custom_imports = dict(
+    imports=[
+        'rgbd_projects.electronic_component.mmseg.datasets.electronic_component',
+        'rgbd_projects.electronic_component.mmseg.datasets.transforms.electronic_component_transforms',
+        'rgbd_projects.electronic_component.mmseg.models.backbones.resnet_rgbd'
+    ],
+    allow_failed_imports=False
+)
+
+# 模型配置 - 使用RGBD输入
+model = dict(
+    type='EncoderDecoder',
+    pretrained=None,  # 覆盖基础配置的pretrained，使用backbone中的init_cfg
+    data_preprocessor=dict(
+        type='SegDataPreProcessor',
+        mean=[123.675, 116.28, 103.53, 127.5],  # RGB + Depth的均值 (Depth用127.5假设归一化到0-255)
+        std=[58.395, 57.12, 57.375, 50.0],      # RGB + Depth的标准差
+        bgr_to_rgb=True,
+        pad_val=0,
+        seg_pad_val=255,
+        size_divisor=1  # 不进行padding，保持pipeline中resize的尺寸
+    ),
+    backbone=dict(
+        type='ResNetV1c_RGBD',  # 使用支持4通道的RGBD ResNet
+        depth=50,
+        in_channels=4,  # RGBD输入 (RGB + Depth)
+        depth_init_method='mean',  # 深度通道初始化方法: 'zero', 'mean', 'copy_red'
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        dilations=(1, 1, 2, 4),
+        strides=(1, 2, 1, 1),
+        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        norm_eval=False,
+        style='pytorch',
+        contract_dilation=True,
+        init_cfg=dict(type='Pretrained', checkpoint='open-mmlab://resnet50_v1c')
+    ),
+    decode_head=dict(
+        type='PSPHead',
+        in_channels=2048,
+        in_index=3,
+        channels=512,
+        pool_scales=(1, 2, 3, 6),
+        dropout_ratio=0.1,
+        num_classes=2,  # 背景 + 电子元件
+        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        align_corners=False,
+        loss_decode=dict(
+            type='CrossEntropyLoss',
+            use_sigmoid=False,
+            loss_weight=1.0
+        )
+    ),
+    auxiliary_head=dict(
+        type='FCNHead',
+        in_channels=1024,
+        in_index=2,
+        channels=256,
+        num_convs=1,
+        concat_input=False,
+        dropout_ratio=0.1,
+        num_classes=2,
+        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        align_corners=False,
+        loss_decode=dict(
+            type='CrossEntropyLoss',
+            use_sigmoid=False,
+            loss_weight=0.4
+        )
+    ),
+    train_cfg=dict(),
+    test_cfg=dict(mode='slide', crop_size=(512, 512), stride=(512, 512))  # 使用slide模式，crop_size=stride确保不重叠
+)
+
+# RGBD 数据管道
+train_pipeline = [
+    dict(type='LoadImageFromFile'),           # 加载RGB图像
+    dict(type='LoadDepthFromFile',            # 加载深度图
+         normalize=True,                      # 归一化深度值到[0, 1]
+         to_float32=True),
+    dict(type='LoadAnnotations'),             # 加载标注
+    dict(type='ConvertInstanceToSemantic'),   # 实例转语义
+    dict(type='Resize',                       # 调整大小
+         scale=(512, 512),
+         keep_ratio=False),
+    dict(type='RandomFlip', prob=0.5),        # 随机翻转
+    dict(type='PhotoMetricDistortion',        # 光度变换（仅应用于RGB）
+         brightness_delta=32,
+         contrast_range=(0.5, 1.5),
+         saturation_range=(0.5, 1.5),
+         hue_delta=18),
+    dict(type='ConcatRGBD'),                  # 拼接RGB和深度为4通道
+    dict(type='PackSegInputs')                # 打包输入
+]
+
+val_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadDepthFromFile',
+         normalize=True,
+         to_float32=True),
+    dict(type='LoadAnnotations'),
+    dict(type='ConvertInstanceToSemantic'),
+    # 不resize，保持原始尺寸1024x1024
+    dict(type='ConcatRGBD'),
+    dict(type='PackSegInputs')
+]
+
+test_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadDepthFromFile',
+         normalize=True,
+         to_float32=True),
+    # 不resize，保持原始尺寸1024x1024，与验证保持一致
+    dict(type='ConcatRGBD'),
+    dict(type='PackSegInputs')
+]
+
+# 数据集配置 - 使用RGBD数据集
+train_dataloader = dict(
+    batch_size=4,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type='InfiniteSampler', shuffle=True),
+    dataset=dict(
+        type='ElectronicComponentRGBDDataset',  # 使用RGBD数据集
+        data_root='data/electronic_component',
+        data_prefix=dict(
+            img_path='images/train',
+            seg_map_path='mask/train',
+            depth_path='depth/depth_npy/train'  # 深度图路径
+        ),
+        pipeline=train_pipeline
+    )
+)
+
+val_dataloader = dict(
+    batch_size=1,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type='ElectronicComponentRGBDDataset',
+        data_root='data/electronic_component',
+        data_prefix=dict(
+            img_path='images/val',
+            seg_map_path='mask/val',
+            depth_path='depth/depth_npy/val'
+        ),
+        pipeline=val_pipeline
+    )
+)
+
+test_dataloader = dict(
+    batch_size=1,
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type='ElectronicComponentRGBDDataset',
+        data_root='data/electronic_component',
+        data_prefix=dict(
+            img_path='images/test',
+            seg_map_path='mask/test',
+            depth_path='depth/depth_npy/test'
+        ),
+        pipeline=test_pipeline
+    )
+)
+
+# 评估器
+val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU'])
+test_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU'])
+
+# 训练配置
+train_cfg = dict(
+    type='IterBasedTrainLoop',
+    max_iters=10000,
+    val_interval=500  # 每500次迭代验证一次
+)
+
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+# 优化器
+optim_wrapper = dict(
+    type='OptimWrapper',
+    optimizer=dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0005),
+    clip_grad=None
+)
+
+# 学习率调度器
+param_scheduler = [
+    dict(
+        type='PolyLR',
+        eta_min=1e-4,
+        power=0.9,
+        begin=0,
+        end=10000,
+        by_epoch=False
+    )
+]
+
+# 钩子配置
+default_hooks = dict(
+    timer=dict(type='IterTimerHook'),
+    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=False),
+    param_scheduler=dict(type='ParamSchedulerHook'),
+    checkpoint=dict(
+        type='CheckpointHook',
+        by_epoch=False,
+        interval=500,
+        max_keep_ckpts=5,
+        save_best='mIoU',
+        rule='greater',
+        save_last=True
+    ),
+    sampler_seed=dict(type='DistSamplerSeedHook'),
+    visualization=dict(type='SegVisualizationHook')
+)
+
+# 环境配置
+env_cfg = dict(
+    cudnn_benchmark=True,
+    mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
+    dist_cfg=dict(backend='nccl')
+)
+
+# 日志配置
+log_processor = dict(by_epoch=False)
+
+# 可视化配置
+vis_backends = [dict(type='LocalVisBackend')]
+visualizer = dict(
+    type='SegLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer'
+)
+
+# 随机性
+randomness = dict(seed=0)
+
+# 工作目录
+work_dir = 'work_dirs/electronic_component_rgbd_pspnet'
+
+# 从RGB基线模型加载权重（仅加载兼容的部分）
+load_from = 'work_dirs/electronic_component_pspnet/best_mIoU_iter_6500.pth'
